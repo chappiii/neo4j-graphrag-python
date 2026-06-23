@@ -214,17 +214,19 @@ IMPORTANT RULES:
 1. Return only abstract schema information, not concrete instances.
 2. Use singular PascalCase labels for node types (e.g., Person, Company, Product).
 3. Use UPPER_SNAKE_CASE labels for relationship types (e.g., WORKS_FOR, MANAGES).
+3.1 Define each relationship type once in "relationship_types". A relationship type name is global: the same type may be reused across multiple patterns (different source/target node pairs), sharing a single set of properties and constraints. Use distinct type names only when patterns genuinely need different properties or constraints.
 4. Include property definitions only when the type can be confidently inferred, otherwise omit them.
 5. When defining patterns, ensure that every node label and relationship label mentioned exists in your lists of node types and relationship types.
 6. Do not create node types that aren't clearly mentioned in the text.
 7. Keep your schema minimal and focused on clearly identifiable patterns in the text.
-8. UNIQUENESS CONSTRAINTS (optional, node properties only):
-8.1 Each node type may have at most one UNIQUENESS constraint in typical designs.
+8. UNIQUENESS CONSTRAINTS (optional, node or relationship properties):
+8.1 Each node or relationship type may have at most one UNIQUENESS constraint in typical designs.
 8.2 Only use properties that seem to not have too many missing values in the sample.
-8.3 Constraints reference node_types by label and specify which properties are unique via "property_names" (a list of one or more property names).
-8.4 Every property in a uniqueness constraint MUST also appear in the corresponding node_type as a property.
+8.3 Constraints reference node_types or relationship_types by label and specify which properties are unique via "property_names" (a list of one or more property names).
+8.4 Every property in a uniqueness constraint MUST also appear in the corresponding node_type or relationship_type as a property.
 8.5 Uniqueness does NOT imply that the property must exist on every node (existence is separate; see rule 9).
 8.6 For composite uniqueness (multiple properties), list all properties in "property_names". The combination of values must be unique.
+8.7 For a node property, use {{"type": "UNIQUENESS", "node_type": "<Label>", "property_names": ["<name>"], "relationship_type": ""}}. For a relationship property, use {{"type": "UNIQUENESS", "node_type": "", "property_names": ["<name>"], "relationship_type": "<REL_TYPE>"}}.
 9. EXISTENCE CONSTRAINTS (optional, single property only):
 9.1 Use EXISTENCE constraints to mark properties that MUST be present (non-null) on every instance.
 9.2 For a node property, add {{"type": "EXISTENCE", "node_type": "<Label>", "property_names": ["<name>"], "relationship_type": ""}} (use an empty string, not null, when the constraint is not on a relationship).
@@ -235,9 +237,10 @@ IMPORTANT RULES:
 10. KEY CONSTRAINTS (optional, Neo4j NODE KEY / RELATIONSHIP KEY):
 10.1 Use KEY when properties must exist on every instance and together form the natural identifier (uniqueness + mandatory presence).
 10.2 Same wire shape as EXISTENCE: exactly one of node_type or relationship_type (non-empty), with the other as "".
-10.3 Do not combine UNIQUENESS and KEY on the same node type with the same properties.
+10.3 Do not combine UNIQUENESS and KEY on the same node or relationship type with the same properties.
 10.4 Do not infer KEY from UNIQUENESS alone; KEY implies required presence, unlike UNIQUENESS alone.
 10.5 For composite key (multiple properties), list all properties in "property_names". All must exist and the combination must be unique.
+10.6 Do not add EXISTENCE on a property already covered by a KEY constraint (KEY already implies mandatory presence).
 11. Never use double underscores (__) as a prefix or suffix in node labels or relationship types (e.g. __Person__ or __KNOWS__ are forbidden).
 
 Accepted property types are: BOOLEAN, DATE, DURATION, FLOAT, INTEGER, LIST,
@@ -293,7 +296,13 @@ Return a valid JSON object that follows this precise structure:
       "node_type": "Person",
       "property_names": ["employee_id"],
       "relationship_type": ""
-    }}
+    }},
+    {{
+      "type": "UNIQUENESS",
+      "node_type": "",
+      "property_names": ["since"],
+      "relationship_type": "WORKS_FOR"
+    }},
     ...
   ]
 }}

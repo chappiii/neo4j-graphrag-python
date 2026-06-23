@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Tuple, Any
 from unittest.mock import AsyncMock, patch, Mock
 
@@ -33,6 +34,8 @@ from neo4j_graphrag.experimental.components.schema import (
     GraphSchema,
     SchemaFromExistingGraphExtractor,
     Pattern,
+    validate_extraction_dict_to_graph_schema,
+    _merge_duplicate_relationship_types,
 )
 import os
 import tempfile
@@ -318,8 +321,33 @@ def test_schema_constraint_validation_property_not_in_node_type() -> None:
     with pytest.raises(SchemaValidationError) as exc_info:
         GraphSchema.model_validate(schema_dict)
 
-    assert "Constraint references undefined property" in str(exc_info.value)
+    assert "constraint references undefined property" in str(exc_info.value)
     assert "on node type 'Person'" in str(exc_info.value)
+
+
+def test_schema_constraint_validation_property_not_in_relationship_type() -> None:
+    schema_dict: dict[str, Any] = {
+        "node_types": [
+            {"label": "Person", "properties": [{"name": "name", "type": "STRING"}]}
+        ],
+        "relationship_types": [
+            {"label": "KNOWS", "properties": [{"name": "since", "type": "INTEGER"}]}
+        ],
+        "constraints": [
+            {
+                "type": "UNIQUENESS",
+                "node_type": "",
+                "relationship_type": "KNOWS",
+                "property_names": ["nonexistent_property"],
+            }
+        ],
+    }
+
+    with pytest.raises(SchemaValidationError) as exc_info:
+        GraphSchema.model_validate(schema_dict)
+
+    assert "constraint references undefined property" in str(exc_info.value)
+    assert "on relationship type 'KNOWS'" in str(exc_info.value)
 
 
 def test_schema_constraint_with_additional_properties_with_allows_unknown_property() -> (
@@ -343,7 +371,7 @@ def test_schema_constraint_with_additional_properties_with_allows_unknown_proper
     with pytest.raises(SchemaValidationError) as exc_info:
         GraphSchema.model_validate(schema_dict)
 
-    assert "Constraint references undefined property 'email'" in str(exc_info.value)
+    assert "constraint references undefined property 'email'" in str(exc_info.value)
 
 
 def test_schema_with_valid_constraints() -> None:
@@ -466,6 +494,261 @@ def test_schema_uniqueness_and_key_same_property_rejected() -> None:
     }
     with pytest.raises(SchemaValidationError, match="UNIQUENESS and KEY"):
         GraphSchema.model_validate(schema_dict)
+
+
+def test_constraint_type_node_type_none_accepted() -> None:
+    constraint = ConstraintType(
+        type=GraphConstraintType.UNIQUENESS,
+        node_type=None,
+        relationship_type="KNOWS",
+        property_names=("since",),
+    )
+    assert constraint.node_type is None
+    assert constraint.relationship_type == "KNOWS"
+
+
+def test_schema_uniqueness_constraint_relationship_valid() -> None:
+    schema_dict: dict[str, Any] = {
+        "node_types": [
+            {"label": "Person", "properties": [{"name": "name", "type": "STRING"}]}
+        ],
+        "relationship_types": [
+            {"label": "KNOWS", "properties": [{"name": "since", "type": "INTEGER"}]}
+        ],
+        "constraints": [
+            {
+                "type": "UNIQUENESS",
+                "node_type": "",
+                "property_names": ["since"],
+                "relationship_type": "KNOWS",
+            }
+        ],
+    }
+    schema = GraphSchema.model_validate(schema_dict)
+    assert schema.uniqueness_property_names_for_relationship("KNOWS") == {"since"}
+    assert schema.uniqueness_property_names_for_node("Person") == set()
+
+
+def test_schema_existence_constraint_relationship_valid() -> None:
+    schema_dict: dict[str, Any] = {
+        "node_types": [
+            {"label": "Person", "properties": [{"name": "name", "type": "STRING"}]}
+        ],
+        "relationship_types": [
+            {"label": "KNOWS", "properties": [{"name": "since", "type": "INTEGER"}]}
+        ],
+        "constraints": [
+            {
+                "type": "EXISTENCE",
+                "node_type": "",
+                "property_names": ["since"],
+                "relationship_type": "KNOWS",
+            }
+        ],
+    }
+    schema = GraphSchema.model_validate(schema_dict)
+    assert schema.existence_property_names_for_relationship("KNOWS") == {"since"}
+    assert schema.mandatory_property_names_for_relationship("KNOWS") == {"since"}
+    assert schema.existence_property_names_for_node("Person") == set()
+
+
+def test_schema_uniqueness_and_key_same_relationship_rejected() -> None:
+    schema_dict: dict[str, Any] = {
+        "node_types": [
+            {"label": "Person", "properties": [{"name": "name", "type": "STRING"}]}
+        ],
+        "relationship_types": [
+            {"label": "KNOWS", "properties": [{"name": "since", "type": "INTEGER"}]}
+        ],
+        "constraints": [
+            {
+                "type": "UNIQUENESS",
+                "node_type": "",
+                "property_names": ["since"],
+                "relationship_type": "KNOWS",
+            },
+            {
+                "type": "KEY",
+                "node_type": "",
+                "property_names": ["since"],
+                "relationship_type": "KNOWS",
+            },
+        ],
+    }
+    with pytest.raises(SchemaValidationError, match="UNIQUENESS and KEY"):
+        GraphSchema.model_validate(schema_dict)
+
+
+def test_schema_key_and_existence_same_node_property_rejected() -> None:
+    schema_dict: dict[str, Any] = {
+        "node_types": [
+            {"label": "Person", "properties": [{"name": "id", "type": "STRING"}]}
+        ],
+        "constraints": [
+            {
+                "type": "KEY",
+                "node_type": "Person",
+                "property_name": "id",
+                "relationship_type": None,
+            },
+            {
+                "type": "EXISTENCE",
+                "node_type": "Person",
+                "property_name": "id",
+                "relationship_type": None,
+            },
+        ],
+    }
+    with pytest.raises(SchemaValidationError, match="EXISTENCE and KEY"):
+        GraphSchema.model_validate(schema_dict)
+
+
+def test_schema_key_and_existence_same_relationship_rejected() -> None:
+    schema_dict: dict[str, Any] = {
+        "node_types": [
+            {"label": "Person", "properties": [{"name": "name", "type": "STRING"}]}
+        ],
+        "relationship_types": [
+            {"label": "KNOWS", "properties": [{"name": "since", "type": "INTEGER"}]}
+        ],
+        "constraints": [
+            {
+                "type": "KEY",
+                "node_type": "",
+                "property_names": ["since"],
+                "relationship_type": "KNOWS",
+            },
+            {
+                "type": "EXISTENCE",
+                "node_type": "",
+                "property_names": ["since"],
+                "relationship_type": "KNOWS",
+            },
+        ],
+    }
+    with pytest.raises(SchemaValidationError, match="EXISTENCE and KEY"):
+        GraphSchema.model_validate(schema_dict)
+
+
+def test_schema_composite_key_and_existence_on_member_rejected() -> None:
+    schema_dict: dict[str, Any] = {
+        "node_types": [
+            {
+                "label": "Actor",
+                "properties": [
+                    {"name": "firstname", "type": "STRING"},
+                    {"name": "surname", "type": "STRING"},
+                ],
+            }
+        ],
+        "constraints": [
+            {
+                "type": "KEY",
+                "node_type": "Actor",
+                "property_names": ["firstname", "surname"],
+            },
+            {
+                "type": "EXISTENCE",
+                "node_type": "Actor",
+                "property_names": ["firstname"],
+            },
+        ],
+    }
+    with pytest.raises(SchemaValidationError, match="EXISTENCE and KEY"):
+        GraphSchema.model_validate(schema_dict)
+
+
+def test_schema_key_and_existence_different_properties_allowed() -> None:
+    schema_dict: dict[str, Any] = {
+        "node_types": [
+            {
+                "label": "Actor",
+                "properties": [
+                    {"name": "firstname", "type": "STRING"},
+                    {"name": "surname", "type": "STRING"},
+                    {"name": "birthdate", "type": "DATE"},
+                ],
+            }
+        ],
+        "constraints": [
+            {
+                "type": "KEY",
+                "node_type": "Actor",
+                "property_names": ["firstname", "surname"],
+            },
+            {
+                "type": "EXISTENCE",
+                "node_type": "Actor",
+                "property_names": ["birthdate"],
+            },
+        ],
+    }
+    schema = GraphSchema.model_validate(schema_dict)
+    assert schema.key_property_names_for_node("Actor") == {"firstname", "surname"}
+    assert schema.existence_property_names_for_node("Actor") == {"birthdate"}
+    assert schema.mandatory_property_names_for_node("Actor") == {
+        "firstname",
+        "surname",
+        "birthdate",
+    }
+
+
+def test_schema_uniqueness_and_existence_same_property_allowed() -> None:
+    schema_dict: dict[str, Any] = {
+        "node_types": [
+            {
+                "label": "Person",
+                "properties": [
+                    {"name": "email", "type": "STRING"},
+                ],
+            }
+        ],
+        "constraints": [
+            {
+                "type": "UNIQUENESS",
+                "node_type": "Person",
+                "property_names": ["email"],
+            },
+            {
+                "type": "EXISTENCE",
+                "node_type": "Person",
+                "property_names": ["email"],
+            },
+        ],
+    }
+    schema = GraphSchema.model_validate(schema_dict)
+    assert schema.uniqueness_property_names_for_node("Person") == {"email"}
+    assert schema.existence_property_names_for_node("Person") == {"email"}
+
+
+def test_required_migration_skips_key_covered_node_property() -> None:
+    schema_dict: dict[str, Any] = {
+        "node_types": [
+            {
+                "label": "Person",
+                "properties": [
+                    {"name": "id", "type": "STRING", "required": True},
+                    {"name": "name", "type": "STRING", "required": True},
+                ],
+            }
+        ],
+        "constraints": [
+            {
+                "type": "KEY",
+                "node_type": "Person",
+                "property_names": ["id"],
+            },
+        ],
+    }
+    schema = GraphSchema.model_validate(schema_dict)
+    person = schema.node_type_from_label("Person")
+    assert person is not None
+    assert all(not p.model_dump().get("required") for p in person.properties)
+    existence_constraints = [
+        c for c in schema.constraints if c.type == GraphConstraintType.EXISTENCE
+    ]
+    assert len(existence_constraints) == 1
+    assert existence_constraints[0].property_names == ("name",)
 
 
 # --- Composite (multi-property) constraint tests ---
@@ -2112,6 +2395,64 @@ def test_extract_graph_constraints_from_metadata_relationship_key_maps_to_key() 
     ]
 
 
+def test_extract_graph_constraints_from_metadata_node_uniqueness_maps_to_uniqueness() -> (
+    None
+):
+    """Neo4j ``NODE_PROPERTY_UNIQUENESS`` metadata maps to node-scoped ``UNIQUENESS`` constraints."""
+    structured_schema: dict[str, Any] = {
+        "metadata": {
+            "constraint": [
+                {
+                    "type": "NODE_PROPERTY_UNIQUENESS",
+                    "labelsOrTypes": ["Person"],
+                    "properties": ["email"],
+                }
+            ]
+        }
+    }
+    out = SchemaFromExistingGraphExtractor._extract_graph_constraints_from_metadata(
+        structured_schema
+    )
+    assert out == [
+        {
+            "type": GraphConstraintType.UNIQUENESS.value,
+            "node_type": "Person",
+            "property_name": "email",
+            "property_names": ("email",),
+            "relationship_type": None,
+        }
+    ]
+
+
+def test_extract_graph_constraints_from_metadata_relationship_uniqueness_maps_to_uniqueness() -> (
+    None
+):
+    """Neo4j ``RELATIONSHIP_PROPERTY_UNIQUENESS`` metadata maps to relationship-scoped ``UNIQUENESS`` constraints."""
+    structured_schema: dict[str, Any] = {
+        "metadata": {
+            "constraint": [
+                {
+                    "type": "RELATIONSHIP_PROPERTY_UNIQUENESS",
+                    "labelsOrTypes": ["KNOWS"],
+                    "properties": ["since"],
+                }
+            ]
+        }
+    }
+    out = SchemaFromExistingGraphExtractor._extract_graph_constraints_from_metadata(
+        structured_schema
+    )
+    assert out == [
+        {
+            "type": GraphConstraintType.UNIQUENESS.value,
+            "node_type": "",
+            "property_name": "since",
+            "property_names": ("since",),
+            "relationship_type": "KNOWS",
+        }
+    ]
+
+
 def test_graph_schema_extraction_output_json_schema_lean_root() -> None:
     """Structured-output schema must not include pipeline-only GraphSchema flags."""
     from neo4j_graphrag.experimental.components.graph_schema_extraction import (
@@ -2183,10 +2524,6 @@ def test_graph_schema_from_extraction_output() -> None:
 
 
 def test_validate_extraction_dict_to_graph_schema() -> None:
-    from neo4j_graphrag.experimental.components.schema import (
-        validate_extraction_dict_to_graph_schema,
-    )
-
     d = {
         "node_types": [
             {
@@ -2201,3 +2538,269 @@ def test_validate_extraction_dict_to_graph_schema() -> None:
     gs = validate_extraction_dict_to_graph_schema(d)
     assert len(gs.node_types) == 1
     assert gs.node_types[0].label == "Person"
+
+
+def test_validate_extraction_dict_merges_duplicate_relationship_types() -> None:
+    """Duplicate same-label relationship types merge into one with unioned properties.
+
+    A KEY constraint referencing properties spread across both duplicates must
+    validate without error, instead of the previous "undefined property" failure.
+    """
+
+    d = {
+        "node_types": [
+            {"label": "Person", "properties": [{"name": "name", "type": "STRING"}]}
+        ],
+        "relationship_types": [
+            {"label": "KNOWS", "properties": [{"name": "since", "type": "INTEGER"}]},
+            {"label": "KNOWS", "properties": [{"name": "weight", "type": "FLOAT"}]},
+        ],
+        "patterns": [],
+        "constraints": [
+            {
+                "type": "KEY",
+                "node_type": "",
+                "relationship_type": "KNOWS",
+                "property_names": ["since", "weight"],
+            }
+        ],
+    }
+
+    gs = validate_extraction_dict_to_graph_schema(d)
+
+    assert len(gs.relationship_types) == 1
+    rel = gs.relationship_type_from_label("KNOWS")
+    assert rel is not None
+    assert [p.name for p in rel.properties] == ["since", "weight"]
+    # The KEY constraint spanning both duplicates' properties is preserved.
+    assert len(gs.constraints) == 1
+    assert gs.constraints[0].property_names == ("since", "weight")
+
+
+def test_validate_extraction_dict_merge_resolves_property_name_conflict_first_wins() -> (
+    None
+):
+    """On a property-name conflict the first definition's attributes are kept."""
+
+    d = {
+        "node_types": [
+            {"label": "Person", "properties": [{"name": "name", "type": "STRING"}]}
+        ],
+        "relationship_types": [
+            {
+                "label": "KNOWS",
+                "properties": [
+                    {
+                        "name": "since",
+                        "type": "INTEGER",
+                        "description": "first definition",
+                    }
+                ],
+            },
+            {
+                "label": "KNOWS",
+                "properties": [
+                    {
+                        "name": "since",
+                        "type": "STRING",
+                        "description": "second definition",
+                    }
+                ],
+            },
+        ],
+        "patterns": [],
+    }
+
+    gs = validate_extraction_dict_to_graph_schema(d)
+
+    rel = gs.relationship_type_from_label("KNOWS")
+    assert rel is not None
+    # Exactly one property per name; the first definition's attributes win.
+    assert len(rel.properties) == 1
+    assert rel.properties[0].name == "since"
+    assert rel.properties[0].type == "INTEGER"
+    assert rel.properties[0].description == "first definition"
+
+
+def test_validate_extraction_dict_merge_keeps_first_entry_non_property_fields() -> None:
+    """The merged entry's description/additional_properties match the first entry."""
+
+    d = {
+        "node_types": [
+            {"label": "Person", "properties": [{"name": "name", "type": "STRING"}]}
+        ],
+        "relationship_types": [
+            {
+                "label": "KNOWS",
+                "description": "first description",
+                "additional_properties": False,
+                "properties": [{"name": "since", "type": "INTEGER"}],
+            },
+            {
+                "label": "KNOWS",
+                "description": "second description",
+                "additional_properties": True,
+                "properties": [{"name": "weight", "type": "FLOAT"}],
+            },
+        ],
+        "patterns": [],
+    }
+
+    gs = validate_extraction_dict_to_graph_schema(d)
+
+    rel = gs.relationship_type_from_label("KNOWS")
+    assert rel is not None
+    assert rel.description == "first description"
+    assert rel.additional_properties is False
+
+
+def test_validate_extraction_dict_merge_emits_warning_per_label(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One warning is logged for each label that had duplicates reconciled."""
+
+    d = {
+        "node_types": [
+            {"label": "Person", "properties": [{"name": "name", "type": "STRING"}]}
+        ],
+        "relationship_types": [
+            {"label": "KNOWS", "properties": [{"name": "since", "type": "INTEGER"}]},
+            {"label": "KNOWS", "properties": [{"name": "weight", "type": "FLOAT"}]},
+            {"label": "LIKES", "properties": [{"name": "rating", "type": "INTEGER"}]},
+            {"label": "LIKES", "properties": [{"name": "comment", "type": "STRING"}]},
+        ],
+        "patterns": [],
+    }
+
+    with caplog.at_level(logging.WARNING):
+        validate_extraction_dict_to_graph_schema(d)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    knows_warnings = [w for w in warnings if "'KNOWS'" in w]
+    likes_warnings = [w for w in warnings if "'LIKES'" in w]
+    assert len(knows_warnings) == 1
+    assert len(likes_warnings) == 1
+    assert "global per name" in knows_warnings[0]
+
+
+def test_validate_extraction_dict_unique_relationship_labels_unchanged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """All-unique relationship-type labels pass through with no merge and no warning."""
+
+    d = {
+        "node_types": [
+            {"label": "Person", "properties": [{"name": "name", "type": "STRING"}]}
+        ],
+        "relationship_types": [
+            {"label": "KNOWS", "properties": [{"name": "since", "type": "INTEGER"}]},
+            {"label": "LIKES", "properties": [{"name": "rating", "type": "INTEGER"}]},
+        ],
+        "patterns": [],
+    }
+
+    with caplog.at_level(logging.WARNING):
+        gs = validate_extraction_dict_to_graph_schema(d)
+
+    assert {r.label for r in gs.relationship_types} == {"KNOWS", "LIKES"}
+    assert not [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "global per name" in r.getMessage()
+    ]
+
+
+def test_from_extraction_output_merges_duplicate_relationship_types() -> None:
+    """The V2 structured-output path also merges duplicate relationship types."""
+    from neo4j_graphrag.experimental.components.graph_schema_extraction import (
+        ExtractedNodeType,
+        ExtractedPropertyType,
+        ExtractedRelationshipType,
+        GraphSchemaExtractionOutput,
+    )
+
+    dto = GraphSchemaExtractionOutput(
+        node_types=[
+            ExtractedNodeType(
+                label="Person",
+                properties=[ExtractedPropertyType(name="name", type="STRING")],
+            )
+        ],
+        relationship_types=[
+            ExtractedRelationshipType(
+                label="KNOWS",
+                properties=[ExtractedPropertyType(name="since", type="INTEGER")],
+            ),
+            ExtractedRelationshipType(
+                label="KNOWS",
+                properties=[ExtractedPropertyType(name="weight", type="FLOAT")],
+            ),
+        ],
+    )
+
+    gs = GraphSchema.from_extraction_output(dto)
+
+    assert len(gs.relationship_types) == 1
+    rel = gs.relationship_type_from_label("KNOWS")
+    assert rel is not None
+    assert [p.name for p in rel.properties] == ["since", "weight"]
+
+
+def test_validate_extraction_dict_does_not_mutate_input_relationship_types() -> None:
+    """Merging must not mutate the caller's input relationship_types in place."""
+    rel_types: list[dict[str, Any]] = [
+        {"label": "KNOWS", "properties": [{"name": "since", "type": "INTEGER"}]},
+        {"label": "KNOWS", "properties": [{"name": "weight", "type": "FLOAT"}]},
+    ]
+    d = {
+        "node_types": [
+            {"label": "Person", "properties": [{"name": "name", "type": "STRING"}]}
+        ],
+        "relationship_types": rel_types,
+        "patterns": [],
+    }
+
+    validate_extraction_dict_to_graph_schema(d)
+
+    # The caller's original list and its entries are left untouched.
+    assert len(rel_types) == 2
+    assert len(rel_types[0]["properties"]) == 1
+    assert rel_types[0]["properties"][0]["name"] == "since"
+    assert rel_types[1]["properties"][0]["name"] == "weight"
+
+
+def test_merge_duplicate_relationship_types_passes_through_non_dict_and_label_less() -> (
+    None
+):
+    """Non-dict and label-less entries pass through untouched and are never merged."""
+    no_label_a = {"properties": [{"name": "a", "type": "STRING"}]}
+    no_label_b = {"label": "", "properties": [{"name": "b", "type": "STRING"}]}
+    not_a_dict: Any = "KNOWS"
+    rel_types: list[Any] = [no_label_a, no_label_b, not_a_dict]
+
+    result = _merge_duplicate_relationship_types(rel_types)
+
+    assert result is not None
+    # All three kept separately, in order; the two label-less dicts are not merged.
+    assert len(result) == 3
+    assert result[0] is no_label_a
+    assert result[1] is no_label_b
+    assert result[2] is not_a_dict
+
+
+def test_merge_duplicate_relationship_types_handles_missing_or_none_properties() -> (
+    None
+):
+    """Entries with a missing or None properties field are treated as empty."""
+    rel_types: list[dict[str, Any]] = [
+        {"label": "KNOWS"},
+        {"label": "KNOWS", "properties": None},
+        {"label": "KNOWS", "properties": [{"name": "since", "type": "INTEGER"}]},
+    ]
+
+    result = _merge_duplicate_relationship_types(rel_types)
+
+    assert result is not None
+    assert len(result) == 1
+    assert result[0]["label"] == "KNOWS"
+    assert [p["name"] for p in result[0]["properties"]] == ["since"]

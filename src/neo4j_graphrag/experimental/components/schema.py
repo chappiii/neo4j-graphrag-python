@@ -97,11 +97,12 @@ _DUNDER_RE = re.compile(r"^__|__$")
 class GraphConstraintType(str, enum.Enum):
     """Constraint kinds for :class:`ConstraintType`.
 
-    ``UNIQUENESS`` is for node properties only in this API.  Supports composite
-    (multi-property) constraints.  ``EXISTENCE`` marks a mandatory (non-null) node or
+    ``UNIQUENESS`` supports both node and relationship scope; composite (multi-property)
+    constraints are allowed.  ``EXISTENCE`` marks a mandatory (non-null) node or
     relationship property (single property only — Neo4j does not support composite
     existence).  ``KEY`` matches Neo4j NODE KEY / RELATIONSHIP KEY: mandatory and unique;
-    supports composite (multi-property) constraints.
+    supports composite (multi-property) constraints. KEY subsumes EXISTENCE for its
+    properties — do not combine KEY and EXISTENCE on the same property.
     """
 
     UNIQUENESS = "UNIQUENESS"
@@ -261,7 +262,7 @@ class ConstraintType(BaseModel):
     """
     Represents a schema-level constraint on a node or relationship property.
 
-    ``UNIQUENESS`` applies to node properties only. ``EXISTENCE`` and ``KEY`` use exactly one of
+    All three types (``UNIQUENESS``, ``EXISTENCE``, ``KEY``) use exactly one of
     ``node_type`` or ``relationship_type`` (non-empty), like Neo4j node vs relationship scope.
 
     ``UNIQUENESS`` and ``KEY`` support composite (multi-property) constraints via
@@ -282,7 +283,7 @@ class ConstraintType(BaseModel):
         ),
     )
     property_names: Tuple[str, ...] = Field(min_length=1)
-    node_type: str = ""
+    node_type: Optional[str] = None
     relationship_type: Optional[str] = None
 
     model_config = ConfigDict(
@@ -293,9 +294,12 @@ class ConstraintType(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def migrate_property_name_to_property_names(cls, data: Any) -> Any:
-        """Backward-compat migration: ``property_name`` → ``property_names``."""
+        """Backward-compat migration: ``property_name`` → ``property_names``; normalizes empty-string scope fields to ``None``."""
         if not isinstance(data, dict):
             return data
+        for field in ("node_type", "relationship_type"):
+            if field in data and (data[field] or "").strip() == "":
+                data[field] = None
         pn = data.get("property_name") or ""
         pns = data.get("property_names") or ()
         if isinstance(pns, str):
@@ -313,18 +317,8 @@ class ConstraintType(BaseModel):
 
     @model_validator(mode="after")
     def validate_constraint_shape(self) -> Self:
-        if self.type == GraphConstraintType.UNIQUENESS:
-            if not (self.node_type and self.node_type.strip()):
-                raise ValueError(
-                    "UNIQUENESS constraint requires a non-empty node_type; "
-                    "relationship uniqueness is not supported on GraphSchema constraints."
-                )
-            if self.relationship_type is not None and self.relationship_type.strip():
-                raise ValueError(
-                    "UNIQUENESS constraint must not set relationship_type; "
-                    "only node-level UNIQUENESS is supported."
-                )
-        elif self.type in (
+        if self.type in (
+            GraphConstraintType.UNIQUENESS,
             GraphConstraintType.EXISTENCE,
             GraphConstraintType.KEY,
         ):
@@ -343,12 +337,12 @@ class ConstraintType(BaseModel):
         return self
 
 
-def _validate_existence_or_key_property_defined(
+def _validate_constraint_property_defined(
     constraint: ConstraintType,
     *,
     node_type_index: dict[str, NodeType],
     relationship_type_index: dict[str, RelationshipType],
-    kind: Literal["EXISTENCE", "KEY"],
+    kind: GraphConstraintType,
 ) -> None:
     """Raise SchemaValidationError if any property in the constraint is not declared on the entity."""
     has_node = bool(constraint.node_type and constraint.node_type.strip())
@@ -365,7 +359,7 @@ def _validate_existence_or_key_property_defined(
         for pn in constraint.property_names:
             if pn not in valid_property_names:
                 raise SchemaValidationError(
-                    f"{kind} constraint references undefined property "
+                    f"{kind.value} constraint references undefined property "
                     f"'{pn}' on node type '{constraint.node_type}'. "
                     f"Valid properties: {valid_property_names}"
                 )
@@ -381,7 +375,7 @@ def _validate_existence_or_key_property_defined(
         for pn in constraint.property_names:
             if pn not in valid_property_names:
                 raise SchemaValidationError(
-                    f"{kind} constraint references undefined property "
+                    f"{kind.value} constraint references undefined property "
                     f"'{pn}' on relationship type '{rlabel}'. "
                     f"Valid properties: {valid_property_names}"
                 )
@@ -511,10 +505,36 @@ class GraphSchema(DataModel):
             return ("", "", "", "")
 
         seen_existence: set[tuple[str, str, str]] = set()
+        key_covered: set[tuple[str, str, str]] = set()
         for c in constraints:
             t, nt, rt, pn = _constraint_identity(c)
             if t in (GraphConstraintType.EXISTENCE.value, "EXISTENCE"):
                 seen_existence.add((nt or "", rt or "", pn))
+            if t not in (GraphConstraintType.KEY.value, "KEY"):
+                continue
+            if isinstance(c, ConstraintType):
+                pnames = c.property_names
+                nt = c.node_type or ""
+                rt = c.relationship_type or ""
+            elif isinstance(c, dict):
+                pnames = c.get("property_names") or ()
+                if isinstance(pnames, str):
+                    pnames = (pnames,)
+                else:
+                    pnames = tuple(pnames)
+                if not pnames:
+                    pn = c.get("property_name") or ""
+                    pnames = (pn,) if pn else ()
+                nt = str(c.get("node_type") or "")
+                rt = str(c.get("relationship_type") or "")
+            else:
+                continue
+            for key_prop_name in pnames:
+                if key_prop_name:
+                    key_covered.add((nt or "", rt or "", key_prop_name))
+
+        def _skip_required_migration(key: tuple[str, str, str]) -> bool:
+            return key in seen_existence or key in key_covered
 
         for node in data.get("node_types") or []:
             if not isinstance(node, dict):
@@ -531,7 +551,7 @@ class GraphSchema(DataModel):
                 if not pname:
                     continue
                 key = (label, "", pname)
-                if key in seen_existence:
+                if _skip_required_migration(key):
                     prop["required"] = False
                     continue
                 constraints.append(
@@ -564,7 +584,7 @@ class GraphSchema(DataModel):
                         new_props.append(prop)
                         continue
                     key = (label, "", pname)
-                    if key in seen_existence:
+                    if _skip_required_migration(key):
                         new_props.append(prop.model_copy(update={"required": False}))
                         continue
                     constraints.append(
@@ -595,7 +615,7 @@ class GraphSchema(DataModel):
                 if not pname:
                     continue
                 key = ("", rlabel, pname)
-                if key in seen_existence:
+                if _skip_required_migration(key):
                     prop["required"] = False
                     continue
                 constraints.append(
@@ -628,7 +648,7 @@ class GraphSchema(DataModel):
                         rel_new_props.append(prop)
                         continue
                     key = ("", rlabel, pname)
-                    if key in seen_existence:
+                    if _skip_required_migration(key):
                         rel_new_props.append(
                             prop.model_copy(update={"required": False})
                         )
@@ -707,32 +727,16 @@ class GraphSchema(DataModel):
             if isinstance(ctype, str):
                 ctype = GraphConstraintType(ctype)
 
-            if ctype == GraphConstraintType.UNIQUENESS:
-                if constraint.node_type not in self._node_type_index:
-                    raise SchemaValidationError(
-                        f"Constraint references undefined node type: {constraint.node_type}"
-                    )
-                node_type = self._node_type_index[constraint.node_type]
-                valid_property_names = {p.name for p in node_type.properties}
-                for pn in constraint.property_names:
-                    if pn not in valid_property_names:
-                        raise SchemaValidationError(
-                            f"Constraint references undefined property '{pn}' "
-                            f"on node type '{constraint.node_type}'. "
-                            f"Valid properties: {valid_property_names}"
-                        )
-            elif ctype in (
+            if ctype in (
+                GraphConstraintType.UNIQUENESS,
                 GraphConstraintType.EXISTENCE,
                 GraphConstraintType.KEY,
             ):
-                kind: Literal["EXISTENCE", "KEY"] = (
-                    "EXISTENCE" if ctype == GraphConstraintType.EXISTENCE else "KEY"
-                )
-                _validate_existence_or_key_property_defined(
+                _validate_constraint_property_defined(
                     constraint,
                     node_type_index=self._node_type_index,
                     relationship_type_index=self._relationship_type_index,
-                    kind=kind,
+                    kind=ctype,
                 )
         return self
 
@@ -741,26 +745,89 @@ class GraphSchema(DataModel):
         """Neo4j: property uniqueness and key constraints cannot share the same schema."""
         node_uniqueness: set[tuple[str, tuple[str, ...]]] = set()
         node_key: set[tuple[str, tuple[str, ...]]] = set()
+        rel_uniqueness: set[tuple[str, tuple[str, ...]]] = set()
+        rel_key: set[tuple[str, tuple[str, ...]]] = set()
         for c in self.constraints:
             ct = c.type
             if isinstance(ct, str):
                 ct = GraphConstraintType(ct)
+            has_node = bool(c.node_type and str(c.node_type).strip())
+            has_rel = bool(c.relationship_type and str(c.relationship_type).strip())
             if ct == GraphConstraintType.UNIQUENESS:
-                node_uniqueness.add((c.node_type, c.property_names))
+                if has_node:
+                    assert c.node_type is not None
+                    node_uniqueness.add((c.node_type, c.property_names))
+                elif has_rel:
+                    assert c.relationship_type is not None
+                    rel_uniqueness.add((c.relationship_type, c.property_names))
             elif ct == GraphConstraintType.KEY:
-                if (
-                    c.node_type
-                    and str(c.node_type).strip()
-                    and not (c.relationship_type and str(c.relationship_type).strip())
-                ):
+                if has_node:
+                    assert c.node_type is not None
                     node_key.add((c.node_type, c.property_names))
-        overlap = node_uniqueness & node_key
-        if overlap:
-            nt, pns = next(iter(overlap))
+                elif has_rel:
+                    assert c.relationship_type is not None
+                    rel_key.add((c.relationship_type, c.property_names))
+        node_overlap = node_uniqueness & node_key
+        if node_overlap:
+            nt, pns = next(iter(node_overlap))
             raise SchemaValidationError(
                 f"UNIQUENESS and KEY constraints cannot apply to the same node type "
                 f"and properties ({nt!r}, {pns!r})."
             )
+        rel_overlap = rel_uniqueness & rel_key
+        if rel_overlap:
+            rt, pns = next(iter(rel_overlap))
+            raise SchemaValidationError(
+                f"UNIQUENESS and KEY constraints cannot apply to the same relationship type "
+                f"and properties ({rt!r}, {pns!r})."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_constraints_key_existence_exclusivity(self) -> Self:
+        """KEY subsumes EXISTENCE: redundant EXISTENCE on KEY-covered properties is invalid."""
+        node_key_props: dict[str, set[str]] = {}
+        rel_key_props: dict[str, set[str]] = {}
+        for c in self.constraints:
+            ct = c.type
+            if isinstance(ct, str):
+                ct = GraphConstraintType(ct)
+            if ct != GraphConstraintType.KEY:
+                continue
+            has_node = bool(c.node_type and str(c.node_type).strip())
+            has_rel = bool(c.relationship_type and str(c.relationship_type).strip())
+            if has_node:
+                assert c.node_type is not None
+                node_key_props.setdefault(c.node_type, set()).update(c.property_names)
+            elif has_rel:
+                assert c.relationship_type is not None
+                rel_key_props.setdefault(c.relationship_type, set()).update(
+                    c.property_names
+                )
+        for c in self.constraints:
+            ct = c.type
+            if isinstance(ct, str):
+                ct = GraphConstraintType(ct)
+            if ct != GraphConstraintType.EXISTENCE:
+                continue
+            pname = c.property_names[0]
+            has_node = bool(c.node_type and str(c.node_type).strip())
+            has_rel = bool(c.relationship_type and str(c.relationship_type).strip())
+            if has_node:
+                assert c.node_type is not None
+                if pname in node_key_props.get(c.node_type, set()):
+                    raise SchemaValidationError(
+                        f"EXISTENCE and KEY constraints cannot apply to the same node type "
+                        f"and property ({c.node_type!r}, {pname!r})."
+                    )
+            elif has_rel:
+                assert c.relationship_type is not None
+                if pname in rel_key_props.get(c.relationship_type, set()):
+                    raise SchemaValidationError(
+                        f"EXISTENCE and KEY constraints cannot apply to the same "
+                        f"relationship type and property "
+                        f"({c.relationship_type!r}, {pname!r})."
+                    )
         return self
 
     def node_type_from_label(self, label: str) -> Optional[NodeType]:
@@ -835,6 +902,19 @@ class GraphSchema(DataModel):
             if ct != GraphConstraintType.UNIQUENESS:
                 continue
             if c.node_type == label:
+                names.update(c.property_names)
+        return names
+
+    def uniqueness_property_names_for_relationship(self, rel_label: str) -> set[str]:
+        """Property names under a UNIQUENESS constraint for this relationship type."""
+        names: set[str] = set()
+        for c in self.constraints:
+            ct = c.type
+            if isinstance(ct, str):
+                ct = GraphConstraintType(ct)
+            if ct != GraphConstraintType.UNIQUENESS:
+                continue
+            if c.relationship_type == rel_label:
                 names.update(c.property_names)
         return names
 
@@ -1225,26 +1305,46 @@ def _extraction_filter_invalid_constraints(
             continue
 
         if ctype == GraphConstraintType.UNIQUENESS.value:
-            if not node_types:
+            node_type = constraint.get("node_type") or ""
+            rel_type = constraint.get("relationship_type")
+            has_node = bool(str(node_type).strip())
+            has_rel = bool(rel_type and str(rel_type).strip())
+            if has_node == has_rel:
                 logging.info(
                     f"Filtering out constraint: {constraint}. "
-                    f"No node types are defined."
+                    f"UNIQUENESS requires exactly one of node_type or relationship_type."
                 )
                 continue
-            node_type = constraint.get("node_type")
-            if not node_type or node_type not in valid_node_labels:
-                logging.info(
-                    f"Filtering out constraint: {constraint}. "
-                    f"Node type '{node_type}' is not valid. Valid node types: {valid_node_labels}"
-                )
-                continue
-            if not _all_properties_valid(
-                prop_names,
-                node_type_properties.get(node_type, set()),
-                node_type,
-                "node type",
-            ):
-                continue
+            if has_node:
+                if node_type not in valid_node_labels:
+                    logging.info(
+                        f"Filtering out constraint: {constraint}. "
+                        f"Node type '{node_type}' is not valid. Valid node types: {valid_node_labels}"
+                    )
+                    continue
+                if not _all_properties_valid(
+                    prop_names,
+                    node_type_properties.get(node_type, set()),
+                    node_type,
+                    "node type",
+                ):
+                    continue
+            else:
+                assert rel_type is not None
+                if rel_type not in valid_rel_labels:
+                    logging.info(
+                        f"Filtering out constraint: {constraint}. "
+                        f"Relationship type '{rel_type}' is not valid. "
+                        f"Valid relationship types: {valid_rel_labels}"
+                    )
+                    continue
+                if not _all_properties_valid(
+                    prop_names,
+                    rel_type_properties.get(rel_type, set()),
+                    rel_type,
+                    "relationship type",
+                ):
+                    continue
             filtered_constraints.append(constraint)
             continue
 
@@ -1318,6 +1418,66 @@ def _extraction_apply_cross_reference_filters(
     return extracted_patterns, extracted_constraints
 
 
+def _merge_duplicate_relationship_types(
+    rel_types: Optional[List[Dict[str, Any]]],
+) -> Optional[List[Dict[str, Any]]]:
+    """Merge relationship types that share the same label into a single entry.
+
+    Neo4j relationship types are global per name, so an LLM-extracted schema that
+    lists the same relationship type more than once must be reconciled into one
+    definition. Properties are unioned and de-duplicated by name in
+    first-occurrence order (the first definition wins on a name conflict);
+    non-property fields (e.g. ``description``, ``additional_properties``) keep the
+    first entry's values. Entries that are not dicts or have no usable label are
+    left in place untouched. Output ordering is deterministic.
+    """
+    if not rel_types:
+        return rel_types
+
+    merged: List[Dict[str, Any]] = []
+    index_by_label: Dict[str, int] = {}
+    merged_labels: set[str] = set()
+
+    for rel_dict in rel_types:
+        label = rel_dict.get("label") if isinstance(rel_dict, dict) else None
+        if not isinstance(rel_dict, dict) or not label:
+            merged.append(rel_dict)
+            continue
+
+        if label not in index_by_label:
+            new_entry = dict(rel_dict)
+            new_entry["properties"] = list(rel_dict.get("properties") or [])
+            index_by_label[label] = len(merged)
+            merged.append(new_entry)
+            continue
+
+        merged_labels.add(label)
+        existing = merged[index_by_label[label]]
+        existing_props: List[Dict[str, Any]] = existing["properties"]
+        existing_names = {
+            p.get("name")
+            for p in existing_props
+            if isinstance(p, dict) and p.get("name")
+        }
+        for prop in rel_dict.get("properties") or []:
+            name = prop.get("name") if isinstance(prop, dict) else None
+            if name and name in existing_names:
+                continue
+            existing_props.append(prop)
+            if name:
+                existing_names.add(name)
+
+    for label in sorted(merged_labels):
+        logger.warning(
+            f"Reconciled duplicate relationship type '{label}' from the "
+            f"extracted schema into a single definition (union of properties). "
+            f"Neo4j relationship types are global per name, so a type cannot be "
+            f"defined more than once."
+        )
+
+    return merged
+
+
 def validate_extraction_dict_to_graph_schema(
     extracted_schema: Dict[str, Any],
 ) -> GraphSchema:
@@ -1327,7 +1487,9 @@ def validate_extraction_dict_to_graph_schema(
     :class:`SchemaFromTextExtractor` (V1 and V2). Does not require a configured LLM.
     """
     node_types = extracted_schema.get("node_types") or []
-    rel_types = extracted_schema.get("relationship_types")
+    rel_types = _merge_duplicate_relationship_types(
+        extracted_schema.get("relationship_types")
+    )
     patterns = extracted_schema.get("patterns")
     constraints = extracted_schema.get("constraints")
 
@@ -1696,7 +1858,7 @@ class SchemaFromExistingGraphExtractor(BaseSchemaBuilder):
     def _extract_graph_constraints_from_metadata(
         structured_schema: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Build EXISTENCE / KEY constraint dicts from Neo4j ``SHOW CONSTRAINTS`` metadata."""
+        """Build EXISTENCE / KEY / UNIQUENESS constraint dicts from Neo4j ``SHOW CONSTRAINTS`` metadata."""
         schema_metadata = structured_schema.get("metadata", {})
         result: list[dict[str, Any]] = []
         seen: set[tuple[str, ...]] = set()
@@ -1760,6 +1922,34 @@ class SchemaFromExistingGraphExtractor(BaseSchemaBuilder):
                 result.append(
                     {
                         "type": GraphConstraintType.KEY.value,
+                        "node_type": "",
+                        "property_name": properties[0],
+                        "property_names": props_tuple,
+                        "relationship_type": lab,
+                    }
+                )
+            elif ctype == "NODE_PROPERTY_UNIQUENESS":
+                dedupe_key = ("UNIQUENESS", "NODE", lab, "", *props_tuple)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                result.append(
+                    {
+                        "type": GraphConstraintType.UNIQUENESS.value,
+                        "node_type": lab,
+                        "property_name": properties[0],
+                        "property_names": props_tuple,
+                        "relationship_type": None,
+                    }
+                )
+            elif ctype == "RELATIONSHIP_PROPERTY_UNIQUENESS":
+                dedupe_key = ("UNIQUENESS", "REL", "", lab, *props_tuple)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                result.append(
+                    {
+                        "type": GraphConstraintType.UNIQUENESS.value,
                         "node_type": "",
                         "property_name": properties[0],
                         "property_names": props_tuple,

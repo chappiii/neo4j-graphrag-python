@@ -2,13 +2,47 @@
 
 ## Next
 
+### Changed
+
+- Experimental: `GraphSchema` validation now rejects `KEY` and `EXISTENCE` constraints on the same node or relationship property (including composite KEY members), since KEY already implies mandatory presence. Legacy `PropertyType.required` migration no longer adds redundant EXISTENCE constraints for KEY-covered properties. The schema-from-text extraction prompt includes the same rule.
+- Experimental: the schema-from-text extraction prompt now instructs the LLM to define each relationship type once and reuse it across patterns, using distinct type names only when patterns genuinely need different properties or constraints.
+- Experimental: LLM-auto-generated schemas now reconcile duplicate `relationship_types` (entries sharing the same label) by merging them into a single type that carries the union of their properties, emitting a warning log. This reflects that Neo4j relationship types are global per name.
+
+## 1.17.0
+
+### Added
+
+- Vector index for all nodes embedding properties in the ParquetWriter result metadata.
+- Added `GeminiEmbedder` and `GeminiLLM` to replace the to be deprecated `VertexAIEmbedder` and `VertexAILLM`.
+
+### Fixed
+
+- Fixed a bug in `FixedSizeSplitter` that was stuck into an infinite loop with texts containing long whitespaces.
+
+
+## 1.16.1
+
+### Added
+
+- Experimental: `EXISTENCE`, `KEY`, and `UNIQUENESS` constraints can now be scoped to relationship types in `GraphSchema`. `ConstraintType` accepts a `relationship_type` field (mutually exclusive with `node_type`); validation rejects schemas where both `UNIQUENESS` and `KEY` target the same relationship type and property set. `ParquetWriter` relationship file entries now include a `constraints` list when the schema defines any for that relationship type.
+- Experimental: `SchemaFromExistingGraphExtractor._extract_graph_constraints_from_metadata` now maps `NODE_PROPERTY_UNIQUENESS` and `RELATIONSHIP_PROPERTY_UNIQUENESS` rows from `SHOW CONSTRAINTS` to the corresponding node-scoped and relationship-scoped `UNIQUENESS` constraints in `GraphSchema`.
+
+### Fixed
+
+- Experimental: `GraphPruning` now drops relationships whose `KEY`- or `EXISTENCE`-constrained properties are null, matching the existing behaviour for nodes. Previously such relationships were logged as pruned but still passed through with empty properties.
+
+## 1.16.0
+
 ### Added
 
 - Added `close` and `aclose` methods to `LLMBase` to gracefully close resources.
+- Added GoogleGenAI (via `google-genai` SDK): includes `GeminiLLM` (generation/tool calling), `GeminiEmbedder` (embeddings), and integration examples/docs.
+- Experimental: `ParquetWriter` node file `constraints` metadata now includes `EXISTENCE` constraints from `GraphSchema` (alongside existing `KEY` and `UNIQUENESS` entries).
 
 ### Changed
 
 - Make clear in documentation that `upsert_vectors` is not for production.
+- Use typed `GraphSchema` instead of `dict[str, Any]` for improved type safety in `ParquetWriter` and `KGWriter`.
 
 ### Fixed
 
